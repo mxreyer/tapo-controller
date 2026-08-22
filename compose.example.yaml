@@ -1,0 +1,22 @@
+# Minimal deployment. Copy to compose.yaml, create .env alongside it, and run
+# `docker compose up -d`.
+#
+# network_mode: host is what makes broadcast discovery work and puts the
+# container on the same L2 segment as the plugs. If you replace it (a bridge
+# with `ports:`, or a VPN sidecar), set TAPO_DISCOVERY=false and list every
+# plug in TAPO_HOSTS — broadcast will not reach them.
+
+services:
+  tapo:
+    image: ghcr.io/mxreyer/tapo-controller:latest
+    env_file: .env
+    network_mode: host
+    volumes:
+      # Which plugs back a server, and how to shut each one down.
+      - ./servers.json:/config/servers.json:ro
+      # SSH key used to run the shutdown command. Keep the private key 0600 on
+      # the host; ssh refuses to use a world-readable key.
+      - ./ssh:/ssh
+    environment:
+      SSH_KNOWN_HOSTS: /ssh/known_hosts
+    restart: unless-stopped

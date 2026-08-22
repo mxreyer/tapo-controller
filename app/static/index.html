@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#111318">
+<title>Plugs</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f5f7; --card: #ffffff; --fg: #14161a; --muted: #6b7280;
+    --line: #e3e5e9; --on: #16a34a; --off: #9aa1ac; --err: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#181b21; --fg:#e8eaed; --muted:#9aa1ac; --line:#262a32; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px 48px; background: var(--bg); color: var(--fg);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 640px; margin: 0 auto; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  button { font: inherit; cursor: pointer; }
+  .ghost {
+    background: transparent; color: var(--muted); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 12px; font-size: 14px;
+  }
+  .ghost:hover { color: var(--fg); }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    padding: 16px; display: flex; align-items: center; gap: 16px; margin-bottom: 12px;
+  }
+  .card.offline { opacity: 0.6; }
+  .card.pending { border-color: #d97706; }
+  .card.failed { border-color: var(--err); }
+  .info { flex: 1; min-width: 0; }
+  .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { font-size: 13px; color: var(--muted); }
+  .meta .err { color: var(--err); }
+  .switch {
+    width: 62px; height: 34px; border-radius: 999px; border: none; flex: none;
+    background: var(--off); position: relative; transition: background .18s ease;
+  }
+  .switch[aria-pressed="true"] { background: var(--on); }
+  .switch::after {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 28px; height: 28px;
+    border-radius: 50%; background: #fff; transition: transform .18s ease;
+    box-shadow: 0 1px 3px rgba(0,0,0,.3);
+  }
+  .switch[aria-pressed="true"]::after { transform: translateX(28px); }
+  .switch:disabled { cursor: wait; opacity: .5; }
+  .switch.pending { background: #d97706; }
+  .switch.pending::after { animation: pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .badge {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+    color: var(--muted); border: 1px solid var(--line); border-radius: 5px;
+    padding: 1px 5px; margin-left: 6px; vertical-align: 1px;
+  }
+  .working { color: #d97706; }
+  .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Plugs</h1>
+    <button class="ghost" id="scan">Scan network</button>
+  </header>
+  <div id="list"><div class="empty">Loading…</div></div>
+</main>
+<script>
+const list = document.getElementById("list");
+let busy = new Set();
+
+const esc = (s) => String(s).replace(/[<>&"]/g, c =>
+  ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" }[c]));
+
+function fmt(p) {
+  // An in-flight or failed job is the most important thing to show.
+  if (p.job) {
+    const cls = p.job.failed ? "err" : "working";
+    return `<span class="${cls}">${esc(p.job.message)}</span>`;
+  }
+  if (!p.online) return `<span class="err">offline</span> · ${esc(p.host)}`;
+  const bits = [esc(p.host)];
+  if (p.ssh_host) bits.push(`server: ${esc(p.ssh_host)}`);
+  if (p.power_w != null) bits.push(`${p.power_w.toFixed(1)} W`);
+  if (p.today_kwh != null) bits.push(`${p.today_kwh.toFixed(2)} kWh today`);
+  return bits.join(" · ");
+}
+
+function render(plugs) {
+  if (!plugs.length) {
+    list.innerHTML = `<div class="empty">No plugs configured.<br>Set TAPO_HOSTS or press “Scan network”.</div>`;
+    return;
+  }
+  list.innerHTML = plugs.map(p => {
+    const working = !!(p.job && p.job.running);
+    const classes = ["card"];
+    if (!p.online) classes.push("offline");
+    if (working) classes.push("pending");
+    if (p.job && p.job.failed) classes.push("failed");
+    // During a shutdown the switch stays live: tapping it cancels.
+    const label = working ? `Cancel shutdown of ${p.name || p.host}`
+                          : `Toggle ${p.name || p.host}`;
+    return `
+    <div class="${classes.join(" ")}">
+      <div class="info">
+        <div class="name">${esc(p.name || p.host)}${p.is_server ? '<span class="badge">server</span>' : ""}</div>
+        <div class="meta">${fmt(p)}</div>
+        ${working ? '<div class="meta">Tap the switch to cancel</div>' : ""}
+      </div>
+      <button class="switch ${working ? "pending" : ""}" aria-pressed="${!!p.is_on}"
+              data-host="${esc(p.host)}" data-working="${working}"
+              ${p.online ? "" : "disabled"} aria-label="${esc(label)}"></button>
+    </div>`;
+  }).join("");
+  // Poll faster while something is mid-shutdown so progress feels live.
+  setPollRate(plugs.some(p => p.job && p.job.running) ? 2000 : 10000);
+}
+
+async function refresh() {
+  if (busy.size) return;              // don't clobber an in-flight toggle
+  try { render(await (await fetch("/api/plugs")).json()); }
+  catch { /* transient; next poll retries */ }
+}
+
+let pollTimer = null, pollRate = 0;
+function setPollRate(ms) {
+  if (ms === pollRate) return;
+  pollRate = ms;
+  clearInterval(pollTimer);
+  pollTimer = setInterval(refresh, ms);
+}
+
+list.addEventListener("click", async (e) => {
+  const btn = e.target.closest(".switch");
+  if (!btn || btn.disabled) return;
+  const host = btn.dataset.host;
+  const working = btn.dataset.working === "true";
+  btn.disabled = true; busy.add(host);
+  // Optimistic flip so the UI feels instant; the response is authoritative.
+  // Not while a shutdown is pending — that tap is a cancel, not a state change.
+  if (!working) {
+    btn.setAttribute("aria-pressed", btn.getAttribute("aria-pressed") !== "true");
+  }
+  try {
+    const r = await fetch(`/api/plugs/${host}/toggle`, { method: "POST" });
+    const p = await r.json();
+    if (r.ok) btn.setAttribute("aria-pressed", !!p.is_on);
+  } finally {
+    btn.disabled = false; busy.delete(host); refresh();
+  }
+});
+
+document.getElementById("scan").addEventListener("click", async (e) => {
+  e.target.disabled = true; e.target.textContent = "Scanning…";
+  try { await fetch("/api/discover", { method: "POST" }); await refresh(); }
+  finally { e.target.disabled = false; e.target.textContent = "Scan network"; }
+});
+
+refresh();
+setPollRate(10000);
+</script>
+</body>
+</html>
