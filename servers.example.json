@@ -8,6 +8,7 @@
     "wait_timeout": 300,
     "grace_seconds": 20,
     "power_threshold_w": 8,
+    "power_cycle_seconds": 10,
     "force_off_on_timeout": false
   }
 }

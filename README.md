@@ -13,6 +13,9 @@ SSHes in, shuts the machine down, waits until it is confirmed down, and only
 then cuts the plug. Switching it back on restores power, and the machine boots
 itself.
 
+Tapping a server card expands it into separate switches for the machine and the
+plug — see [Expanded controls](#expanded-controls-the-server-and-the-plug-separately).
+
 ## Setup
 
 1. Give each plug a **static IP / DHCP reservation** in your router. Plugs that
@@ -74,6 +77,7 @@ itself.
     "wait_timeout": 300,
     "grace_seconds": 20,
     "power_threshold_w": 8,
+    "power_cycle_seconds": 10,
     "force_off_on_timeout": false
   }
 }
@@ -112,6 +116,36 @@ whole sequence:
 ```sh
 curl -X POST 'http://homeserver:8080/api/plugs/192.168.1.50/off?force=true'
 ```
+
+### Expanded controls: the server and the plug, separately
+
+Tap a server card to expand it and drive the two independently.
+
+**Server** — the machine, never the relay.
+
+| | What it does |
+| --- | --- |
+| Off | The shutdown sequence above, but it stops once the machine is down and **leaves the plug powered**. |
+| On | **Power-cycles the plug**: off, `power_cycle_seconds` (default 10), on. A machine in soft-off behind a live plug needs a real AC loss before it boots. |
+
+**Tapo plug** — the relay only, marked with a warning. No SSH, no waiting, no
+checks; off cuts power immediately. It overrides anything in progress. Cutting
+power to a machine that is still answering asks for confirmation first.
+
+### When the machine crashes
+
+A hard crash leaves the machine unreachable over SSH while the plug still reads
+on and draws running-level power. The combined toggle refuses to act on that, by
+design — it cannot tell a hung machine from a busy one.
+
+With `power_threshold_w` set, the expanded view compares SSH reachability against
+the power reading and shows the server as **unreachable — crashed**; its switch
+then power-cycles instead of attempting an SSH shutdown that cannot succeed.
+Without the threshold there is no second signal and a crashed machine reads as
+merely off, so set it.
+
+A power cycle cannot be cancelled part-way, and the container restores power if
+stopped mid-cycle. The plug switch overrides it.
 
 ### Two things to set up on the server
 
@@ -160,11 +194,50 @@ Handy for scripting or hooking into Home Assistant / shortcuts:
 | `POST` | `/api/plugs/{ip}/off?force=true` | Cut power immediately, skipping shutdown |
 | `POST` | `/api/plugs/{ip}/toggle` | Toggle |
 | `POST` | `/api/plugs/{ip}/cancel` | Abort a shutdown in progress |
+| `POST` | `/api/plugs/{ip}/server/off` | Shut the machine down over SSH, **leave the plug on** |
+| `POST` | `/api/plugs/{ip}/server/on` | Power-cycle the plug so the machine boots |
+| `POST` | `/api/plugs/{ip}/plug/on` | Relay on — no SSH, no checks |
+| `POST` | `/api/plugs/{ip}/plug/off` | Relay off — no SSH, no checks |
+| `POST` | `/api/plugs/{ip}/plug/cycle` | Relay off, pause, back on |
 | `POST` | `/api/discover` | Re-scan the LAN |
 | `GET` | `/healthz` | Health check (never requires auth) |
 
+`GET /api/plugs` reports `server_state` for server plugs: `up`, `down` (machine
+off, plug still powered), `no_power` (plug off), or `unreachable` (drawing power
+but not answering — crashed).
+
 ```sh
 curl -X POST http://homeserver:8080/api/plugs/192.168.1.50/off
+
+# Reboot without cutting power:
+curl -X POST http://homeserver:8080/api/plugs/192.168.1.50/server/off
+curl -X POST http://homeserver:8080/api/plugs/192.168.1.50/server/on
+
+# Revive a crashed machine:
+curl -X POST http://homeserver:8080/api/plugs/192.168.1.50/plug/cycle
+```
+
+## Testing local changes
+
+`compose.yaml` runs the published image, so `docker compose up -d` ignores local
+edits. To build the working tree instead, add an override file next to it:
+
+```yaml
+# compose.local.yaml
+services:
+  tapo-controller:
+    build: /path/to/this/repo
+    # A separate tag, so the local build cannot overwrite the pulled image.
+    image: tapo-controller:local
+    pull_policy: build
+```
+
+Compose auto-loads only `compose.override.yaml`, so this name keeps local builds
+opt-in:
+
+```sh
+docker compose -f compose.yaml -f compose.local.yaml up -d --build
+docker compose up -d    # back to the published image
 ```
 
 ## Running without Docker

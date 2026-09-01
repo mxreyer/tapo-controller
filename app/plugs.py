@@ -12,6 +12,13 @@ from .servers import ServerConfig, load_servers
 
 log = logging.getLogger("tapo.plugs")
 
+# How stale an SSH reachability probe may be before a status poll redoes it.
+# The UI polls every 2s while a job runs; probing that often buys nothing.
+PROBE_MAX_AGE = 4.0
+
+# Used when power-cycling a plug that has no server config to read it from.
+DEFAULT_POWER_CYCLE_SECONDS = 10
+
 
 def _env_list(name: str) -> list[str]:
     return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
@@ -19,12 +26,15 @@ def _env_list(name: str) -> list[str]:
 
 @dataclass
 class Job:
-    """A long-running action on a plug (currently: graceful server shutdown)."""
+    """A long-running action on a plug (graceful shutdown, or a power cycle)."""
 
     action: str
     message: str
     started_at: float = field(default_factory=time.monotonic)
     failed: bool = False
+    # A power cycle leaves the plug off halfway through, so the UI must not
+    # offer to cancel one.
+    cancellable: bool = True
     task: asyncio.Task | None = None
 
     def as_dict(self) -> dict:
@@ -32,6 +42,7 @@ class Job:
             "action": self.action,
             "message": self.message,
             "failed": self.failed,
+            "cancellable": self.cancellable,
             "elapsed": round(time.monotonic() - self.started_at),
             "running": self.task is not None and not self.task.done(),
         }
@@ -68,6 +79,7 @@ class PlugManager:
                 self.hosts.append(host)
         self._devices: dict[str, Device] = {}
         self._jobs: dict[str, Job] = {}
+        self._probes: dict[str, tuple[float, bool]] = {}
 
     # ---------------------------------------------------------------- devices
 
@@ -110,6 +122,37 @@ class PlugManager:
 
     # ---------------------------------------------------------------- status
 
+    async def _probe_server(self, host: str, cfg: ServerConfig, max_age: float = 0.0) -> bool:
+        """Is the machine answering on its SSH port? Cached for `max_age` seconds."""
+        if max_age:
+            cached = self._probes.get(host)
+            if cached and time.monotonic() - cached[0] < max_age:
+                return cached[1]
+        alive = await _port_open(cfg.ssh_host, cfg.ssh_port)
+        self._probes[host] = (time.monotonic(), alive)
+        return alive
+
+    async def _server_state(self, host: str, cfg: ServerConfig, entry: dict) -> str:
+        """Best guess at what the machine behind the plug is doing.
+
+        `unreachable` means the plug is on and drawing running-level power while
+        nothing answers on SSH — a crash, which only a power cycle fixes.
+        Telling it from an ordinary soft-off needs `power_threshold_w`; without
+        one, both look like `down`.
+        """
+        if not entry["is_on"]:
+            return "no_power"
+        if await self._probe_server(host, cfg, PROBE_MAX_AGE):
+            return "up"
+        watts = entry["power_w"]
+        if (
+            cfg.power_threshold_w is not None
+            and watts is not None
+            and watts > cfg.power_threshold_w
+        ):
+            return "unreachable"
+        return "down"
+
     async def _status(self, host: str) -> dict:
         job = self._jobs.get(host)
         try:
@@ -142,8 +185,10 @@ class PlugManager:
         if energy is not None:
             entry["power_w"] = energy.current_consumption
             entry["today_kwh"] = energy.consumption_today
-        if host in self.servers:
-            entry["ssh_host"] = self.servers[host].ssh_host
+        cfg = self.servers.get(host)
+        if cfg is not None:
+            entry["ssh_host"] = cfg.ssh_host
+            entry["server_state"] = await self._server_state(host, cfg, entry)
         return entry
 
     async def status(self, host: str) -> dict:
@@ -175,6 +220,20 @@ class PlugManager:
             dev = await self._device(host)
             await (dev.turn_on() if on else dev.turn_off())
 
+    async def set_plug(self, host: str, on: bool) -> dict:
+        """Drive the relay directly: no SSH, no waiting, no questions asked.
+
+        The escape hatch for a machine that has crashed hard, where there is no
+        graceful shutdown left to attempt.
+        """
+        if host not in self.hosts:
+            raise KeyError(host)
+        # This switch overrides everything, including a power cycle in flight.
+        self.cancel_job(host, force=True)
+        self._jobs.pop(host, None)
+        await self._switch(host, on)
+        return await self._status(host)
+
     async def set_state(self, host: str, on: bool, force: bool = False) -> dict:
         """Turn a plug on/off. Server plugs get a graceful shutdown first."""
         if host not in self.hosts:
@@ -182,22 +241,19 @@ class PlugManager:
 
         if on:
             # Turning on cancels any shutdown in flight, then powers the plug.
-            self.cancel_job(host)
-            self._jobs.pop(host, None)
-            await self._switch(host, True)
-            return await self._status(host)
+            return await self.set_plug(host, True)
 
         cfg = self.servers.get(host)
         if cfg and not force:
             return await self.begin_shutdown(host, cfg)
 
-        self._jobs.pop(host, None)
-        await self._switch(host, False)
-        return await self._status(host)
+        return await self.set_plug(host, False)
 
     async def toggle(self, host: str) -> dict:
         job = self._jobs.get(host)
         if job and job.task and not job.task.done():
+            if not job.cancellable:
+                return await self._status(host)
             # A tap during a pending shutdown means "never mind".
             self.cancel_job(host)
             self._jobs.pop(host, None)
@@ -210,24 +266,90 @@ class PlugManager:
 
     # ------------------------------------------------- graceful server power
 
-    def cancel_job(self, host: str) -> bool:
+    def _clear_job(self, host: str, job: Job) -> None:
+        """Retire a finished job, unless it has already been superseded.
+
+        Cancellation is asynchronous, so a replaced job runs its cleanup after
+        the new one is already in the slot. Only the current occupant may clear.
+        """
+        if self._jobs.get(host) is job:
+            del self._jobs[host]
+
+    def cancel_job(self, host: str, force: bool = False) -> bool:
+        """Abort whatever is running on this plug.
+
+        A power cycle refuses ordinary cancellation — abandoning one leaves the
+        plug dark. `force` is for the direct plug switch, the override of last
+        resort.
+        """
         job = self._jobs.get(host)
         if job and job.task and not job.task.done():
+            if not job.cancellable and not force:
+                log.info("refusing to cancel %s job for %s", job.action, host)
+                return False
             job.task.cancel()
             log.info("cancelled %s job for %s", job.action, host)
             return True
         return False
 
-    async def begin_shutdown(self, host: str, cfg: ServerConfig) -> dict:
-        """Kick off shutdown-then-cut-power in the background, return at once."""
+    async def begin_shutdown(self, host: str, cfg: ServerConfig, cut_power: bool = True) -> dict:
+        """Kick off the shutdown in the background and return at once.
+
+        With `cut_power` the plug is switched off once the machine is confirmed
+        down; without it the plug is left powered, ready for a power cycle.
+        """
         existing = self._jobs.get(host)
         if existing and existing.task and not existing.task.done():
             return await self._status(host)
 
         job = Job(action="shutdown", message=f"Sending shutdown to {cfg.ssh_host}…")
         self._jobs[host] = job
-        job.task = asyncio.create_task(self._shutdown_then_off(host, cfg, job))
+        job.task = asyncio.create_task(self._shutdown_job(host, cfg, job, cut_power))
         return await self._status(host)
+
+    async def begin_power_cycle(self, host: str, cfg: ServerConfig | None = None) -> dict:
+        """Cut power briefly and restore it, in the background.
+
+        A machine in soft-off behind a live plug needs a real AC loss before its
+        BIOS powers it on; a crashed one needs the same. Both are this.
+        """
+        if host not in self.hosts:
+            raise KeyError(host)
+        existing = self._jobs.get(host)
+        if existing and existing.task and not existing.task.done():
+            if not existing.cancellable:
+                return await self._status(host)
+            self.cancel_job(host)
+
+        seconds = cfg.power_cycle_seconds if cfg else DEFAULT_POWER_CYCLE_SECONDS
+        job = Job(
+            action="power-cycle",
+            message="Cutting power…",
+            cancellable=False,
+        )
+        self._jobs[host] = job
+        job.task = asyncio.create_task(self._power_cycle_job(host, job, seconds))
+        return await self._status(host)
+
+    async def _power_cycle_job(self, host: str, job: Job, seconds: int) -> None:
+        try:
+            await self._switch(host, False)
+            for remaining in range(seconds, 0, -1):
+                job.message = f"Power off — restoring in {remaining}s"
+                await asyncio.sleep(1)
+            job.message = "Restoring power…"
+            await self._switch(host, True)
+            log.info("power cycled plug %s", host)
+            self._clear_job(host, job)
+        except asyncio.CancelledError:
+            # close() restores power itself; nothing else may cancel this.
+            log.warning("power cycle for %s cancelled mid-flight", host)
+            self._clear_job(host, job)
+            raise
+        except Exception as exc:
+            job.failed = True
+            job.message = f"Power cycle failed: {exc}"
+            log.exception("power cycle for %s failed", host)
 
     async def _run_ssh(self, cfg: ServerConfig) -> tuple[int, str]:
         args = [
@@ -265,7 +387,7 @@ class PlugManager:
         plug meters power, until draw drops below the configured threshold)."""
         confirmations = 0
         while time.monotonic() < deadline:
-            alive = await _port_open(cfg.ssh_host, cfg.ssh_port)
+            alive = await self._probe_server(host, cfg)
             if alive:
                 confirmations = 0
             else:
@@ -293,7 +415,7 @@ class PlugManager:
             await asyncio.sleep(cfg.poll_interval)
         return False
 
-    async def _shutdown_then_off(self, host: str, cfg: ServerConfig, job: Job) -> None:
+    async def _shutdown_job(self, host: str, cfg: ServerConfig, job: Job, cut_power: bool) -> None:
         try:
             rc, stderr = await self._run_ssh(cfg)
             # A dropped connection mid-shutdown is normal, so a non-zero exit is
@@ -310,17 +432,23 @@ class PlugManager:
 
             if not went_down:
                 detail = f" (ssh exited {rc}: {stderr})" if rc != 0 else ""
-                if cfg.force_off_on_timeout:
+                if cut_power and cfg.force_off_on_timeout:
                     job.message = f"Timed out waiting for {cfg.ssh_host}; cutting power anyway"
                     log.warning("forcing plug %s off after timeout", host)
                     await self._switch(host, False)
-                    self._jobs.pop(host, None)
+                    self._clear_job(host, job)
                     return
                 job.failed = True
                 job.message = (
                     f"{cfg.ssh_host} did not shut down in time — plug left ON{detail}"
                 )
                 log.error("shutdown of %s failed; leaving plug %s on", cfg.ssh_host, host)
+                return
+
+            if not cut_power:
+                # Plug stays live, ready to be power-cycled back up.
+                log.info("%s is down; plug %s left on as asked", cfg.ssh_host, host)
+                self._clear_job(host, job)
                 return
 
             if cfg.grace_seconds:
@@ -330,11 +458,11 @@ class PlugManager:
 
             await self._switch(host, False)
             log.info("%s is down; plug %s switched off", cfg.ssh_host, host)
-            self._jobs.pop(host, None)
+            self._clear_job(host, job)
 
         except asyncio.CancelledError:
             log.info("shutdown job for %s cancelled", host)
-            self._jobs.pop(host, None)
+            self._clear_job(host, job)
             raise
         except Exception as exc:
             job.failed = True
@@ -342,8 +470,16 @@ class PlugManager:
             log.exception("shutdown job for %s failed", host)
 
     async def close(self) -> None:
-        for host in list(self._jobs):
-            self.cancel_job(host)
+        for host, job in list(self._jobs.items()):
+            if job.action == "power-cycle" and job.task and not job.task.done():
+                # Never exit with a plug left dark halfway through a cycle.
+                job.task.cancel()
+                try:
+                    await self._switch(host, True)
+                except Exception:
+                    log.error("could not restore power to %s while shutting down", host)
+            else:
+                self.cancel_job(host)
         for dev in self._devices.values():
             try:
                 await dev.disconnect()

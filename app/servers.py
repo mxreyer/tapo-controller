@@ -36,6 +36,10 @@ class ServerConfig:
     force_off_on_timeout: bool = False
     ssh_connect_timeout: int = 10
     ssh_options: list[str] = field(default_factory=list)
+    # How long power stays off during a power cycle. Long enough that the PSU
+    # drains and the board sees a genuine AC loss on the way back up, which is
+    # what triggers "Restore on AC Power Loss = Power On" and boots the machine.
+    power_cycle_seconds: int = 10
 
     @classmethod
     def from_dict(cls, host: str, raw: dict) -> "ServerConfig":

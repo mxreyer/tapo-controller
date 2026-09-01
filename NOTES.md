@@ -29,6 +29,11 @@ against stubs: machine-never-goes-down, ssh auth failure,
 `force_off_on_timeout`, and cancel-mid-wait. The happy path is proven on real
 hardware; the safety net is not.
 
+The split server/plug controls and the power cycle are in the same position:
+exercised against stubs, never watched on real hardware. `power_cycle_seconds:
+10` is a guess at "long enough for the PSU to drain" — if a cycle leaves the
+machine dark, raise that first.
+
 ## Read this before debugging "the plugs stopped working"
 
 **Tapo firmware 1.4.0 breaks local control by default.** It switched plugs to a
@@ -49,6 +54,17 @@ The fix is not in this repo — it is a per-device toggle in the Tapo phone app:
 Expect it to recur after firmware updates, and to need doing on every plug
 individually.
 
+## `power_threshold_w` is what makes a crash visible
+
+It started as a second confirmation that a shutdown had finished. It now also
+carries the only signal separating **crashed** from **cleanly off**: both are
+"plug on, SSH not answering", and the draw is the only difference. Without it a
+hung machine shows as merely off.
+
+A hung machine usually draws close to its idle-running figure, so the same wide
+gap works. One that crashes into a low-power state still reads as cleanly off,
+and no threshold-tuning fixes that — the plug switch is the fallback.
+
 ## Design invariant: a failed shutdown leaves the plug ON
 
 When the SSH shutdown fails or times out, the plug is **deliberately left on**
@@ -63,10 +79,32 @@ power-draw threshold as a second independent signal, and the grace period after
 the machine stops answering.
 
 Escape hatches for the opposite behaviour already exist: `force_off_on_timeout`
-per server in `servers.json`, and `POST /api/plugs/{ip}/off?force=true` per call.
+per server in `servers.json`, `POST /api/plugs/{ip}/off?force=true` per call,
+and the **Tapo plug** switch in the UI. That switch overrides everything,
+including a power cycle in flight; it is the control of last resort and must not
+learn to second-guess.
 
 If someone reports "it didn't turn off", check for a failed job / red card
-first — that is most likely this feature working, not a bug.
+first — that is most likely this feature working, not a bug. The answer is to
+expand the card, not to loosen the invariant.
+
+## Why "turn the server on" cuts power first
+
+The server switch's On position power-cycles rather than just switching on,
+because the plug is usually already on. `server/off` leaves power up, so the
+machine sits in soft-off behind a live plug, and only an AC loss boots it from
+there (see the `Restore on AC Power Loss` trap below). Switching an already-on
+plug on again is a no-op, so the cycle is the entire mechanism.
+
+- A power cycle is **not cancellable**. Abandoning one leaves the plug off and
+  the machine dark, worse than either end state.
+- `close()` restores power to a plug caught mid-cycle rather than awaiting the
+  job, so a container restart cannot strand the server without power. It is the
+  one job that does not follow the "jobs live in memory" rule below.
+- Jobs are one-per-plug and cancellation is asynchronous, so a replaced job runs
+  its cleanup *after* its replacement is installed. `_clear_job` lets a finishing
+  job clear the slot only if it still owns it; a plain `pop` reintroduces a race
+  that silently loses the new job.
 
 ## Traps that look like app bugs
 
@@ -108,4 +146,5 @@ into the host's port space, where 8080 is often already taken.
 ## Shutdown jobs live in memory
 
 Restarting the container mid-shutdown loses the job, leaving the plug on and the
-machine off. Switch the plug off again once it settles.
+machine off. Switch the plug off again once it settles. (Power cycles are the
+exception — see above.)
