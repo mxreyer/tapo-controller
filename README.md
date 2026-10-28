@@ -172,7 +172,7 @@ stopped mid-cycle. The plug switch overrides it.
   `~max/.ssh/authorized_keys`:
 
   ```
-  restrict,command="sudo -n /sbin/shutdown -h now",from="192.168.1.10" ssh-ed25519 AAAA... tapo-controller
+  restrict,command="sudo -n /sbin/shutdown -h now" ssh-ed25519 AAAA... tapo-controller
   ```
 
   - `command="..."` makes the server run this command whatever the client asks
@@ -181,14 +181,14 @@ stopped mid-cycle. The plug switch overrides it.
     config describes what really runs.
   - `restrict` turns off terminal sessions, port/agent/X11 forwarding and
     `~/.ssh/rc`.
-  - `from="..."` accepts the key only from that address: the Docker host's LAN
-    IP under `network_mode: host`, or the sidecar's address behind
-    Tailscale/WireGuard.
 
-  A stolen key can then only shut the machine down, from that one address. For
-  more separation, give the key its own user (`sudo useradd -m -s /bin/sh
-  tapo`), use that name in the sudoers rule and as `ssh_user`, and keep the key
-  out of your own account entirely.
+  A stolen key can then only shut the machine down. To also tie it to one
+  source address, add `from="192.168.1.10"` to the options: the Docker host's
+  LAN IP under `network_mode: host`, or the sidecar's address behind
+  Tailscale/WireGuard. It is optional, and breaks shutdowns if that address
+  changes. For more separation, give the key its own user (`sudo useradd -m -s
+  /bin/sh tapo`), use that name in the sudoers rule and as `ssh_user`, and keep
+  the key out of your own account entirely.
 
   To check it, try to run something else with the key from the Docker host —
   it should shut the machine down rather than print the file:
