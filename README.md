@@ -48,13 +48,14 @@ plug — see [Expanded controls](#expanded-controls-the-server-and-the-plug-sepa
 
    ```sh
    cp servers.example.json servers.json
-   mkdir -p ssh && ssh-keygen -t ed25519 -f ssh/id_ed25519 -N ""
-   ssh-copy-id -i ssh/id_ed25519.pub max@192.168.1.20
+   mkdir -p ssh && ssh-keygen -t ed25519 -f ssh/id_ed25519 -N "" -C tapo-controller
    ssh-keyscan -H 192.168.1.20 >> ssh/known_hosts
+   cat ssh/id_ed25519.pub
    ```
 
-   Then restrict that key on the server so it can only shut the machine down —
-   see [Three things to set up on the server](#three-things-to-set-up-on-the-server).
+   Then set up a `tapo` user on the server that can only shut the machine down,
+   using the public key printed by the last command — see
+   [Setting up the server](#setting-up-the-server).
 
    Otherwise create an empty one so the mount succeeds: `echo '{}' > servers.json`
 
@@ -74,9 +75,9 @@ plug — see [Expanded controls](#expanded-controls-the-server-and-the-plug-sepa
 {
   "192.168.1.50": {
     "ssh_host": "192.168.1.20",
-    "ssh_user": "max",
+    "ssh_user": "tapo",
     "ssh_key": "/ssh/id_ed25519",
-    "shutdown_command": "sudo /sbin/shutdown -h now",
+    "shutdown_command": "sudo -n /sbin/shutdown -h now",
     "wait_timeout": 300,
     "grace_seconds": 20,
     "power_threshold_w": 8,
@@ -150,52 +151,77 @@ merely off, so set it.
 A power cycle cannot be cancelled part-way, and the container restores power if
 stopped mid-cycle. The plug switch overrides it.
 
-### Three things to set up on the server
+### Setting up the server
 
-- **Passwordless shutdown.** The SSH user needs to run the shutdown without a
-  password prompt, or `sudo` will hang and the job will time out. Grant exactly
-  the command in `shutdown_command`, arguments included, and nothing more:
+The app logs in over SSH for one thing only: running `shutdown_command`. Its
+up/down checks just probe the SSH port and never log in. So it gets its own
+user, `tapo`, whose key can shut the machine down and do nothing else. Run
+these **on the server**.
 
-  ```sh
-  echo 'max ALL=(root) NOPASSWD: /sbin/shutdown -h now' | \
-    sudo tee /etc/sudoers.d/tapo-shutdown
-  sudo visudo -cf /etc/sudoers.d/tapo-shutdown
-  ```
+1. **Create the user.**
 
-  The path must match the one in `shutdown_command` exactly — check it with
-  `command -v shutdown` (often `/usr/sbin/shutdown`). If you SSH in as root,
-  drop the `sudo ` from `shutdown_command` instead.
-- **Restrict the key to shutdown.** The app uses SSH for one thing only: running
-  `shutdown_command`. Its up/down checks just probe the SSH port and never log
-  in. So the key can be locked down so that it can shut the machine down and do
-  nothing else. On the server, prefix the key's line in
-  `~max/.ssh/authorized_keys`:
+   ```sh
+   sudo useradd -m -s /bin/sh tapo
+   ```
 
-  ```
-  restrict,command="sudo -n /sbin/shutdown -h now" ssh-ed25519 AAAA... tapo-controller
-  ```
+   `-m` creates `/home/tapo`, where sshd looks for the key. The shell must be a
+   real one: sshd runs the forced command below through it, so `nologin` would
+   break shutdowns. No password is set, so the key is the only way in.
 
-  - `command="..."` makes the server run this command whatever the client asks
-    for: a shell, `scp`, `sftp` or any other command gets the shutdown instead.
-    Keep `shutdown_command` in `servers.json` set to the same thing so the
-    config describes what really runs.
-  - `restrict` turns off terminal sessions, port/agent/X11 forwarding and
-    `~/.ssh/rc`.
+2. **Install the key, locked to the shutdown command.** Paste the public key
+   printed during [Setup](#setup) in place of `ssh-ed25519 AAAA...`:
 
-  A stolen key can then only shut the machine down. To also tie it to one
-  source address, add `from="192.168.1.10"` to the options: the Docker host's
-  LAN IP under `network_mode: host`, or the sidecar's address behind
-  Tailscale/WireGuard. It is optional, and breaks shutdowns if that address
-  changes. For more separation, give the key its own user (`sudo useradd -m -s
-  /bin/sh tapo`), use that name in the sudoers rule and as `ssh_user`, and keep
-  the key out of your own account entirely.
+   ```sh
+   sudo install -d -m 700 -o tapo -g tapo /home/tapo/.ssh
+   echo 'restrict,command="sudo -n /sbin/shutdown -h now" ssh-ed25519 AAAA... tapo-controller' | \
+     sudo tee /home/tapo/.ssh/authorized_keys
+   sudo chown tapo:tapo /home/tapo/.ssh/authorized_keys
+   sudo chmod 600 /home/tapo/.ssh/authorized_keys
+   ```
 
-  To check it, try to run something else with the key from the Docker host —
-  it should shut the machine down rather than print the file:
+   - `command="..."` makes the server run this command whatever the client
+     asks for: a shell, `scp`, `sftp` or any other command gets the shutdown
+     instead. Keep `shutdown_command` in `servers.json` set to the same thing
+     so the config describes what really runs.
+   - `restrict` turns off terminal sessions, port/agent/X11 forwarding and
+     `~/.ssh/rc`.
 
-  ```sh
-  ssh -i ssh/id_ed25519 max@192.168.1.20 'cat /etc/passwd'
-  ```
+   A stolen key can then only shut the machine down. To also tie it to one
+   source address, add `from="192.168.1.10"` to the options: the Docker host's
+   LAN IP under `network_mode: host`, or the sidecar's address behind
+   Tailscale/WireGuard. It is optional, and breaks shutdowns if that address
+   changes.
+
+3. **Allow passwordless shutdown.** `tapo` must run the shutdown without a
+   password prompt, or `sudo -n` fails and the job errors out. Grant exactly
+   that command, arguments included, and nothing more:
+
+   ```sh
+   echo 'tapo ALL=(root) NOPASSWD: /sbin/shutdown -h now' | \
+     sudo tee /etc/sudoers.d/tapo-shutdown
+   sudo chmod 440 /etc/sudoers.d/tapo-shutdown
+   sudo visudo -cf /etc/sudoers.d/tapo-shutdown
+   ```
+
+   The path must match the one in the forced command exactly — check it with
+   `command -v shutdown` (often `/usr/sbin/shutdown`) and use the same path in
+   all three places: here, `authorized_keys` and `shutdown_command`.
+
+4. **Test it** from the Docker host. Asking for anything else should shut the
+   machine down rather than print the file:
+
+   ```sh
+   ssh -i ssh/id_ed25519 tapo@192.168.1.20 'cat /etc/passwd'
+   ```
+
+   If it prints `Permission denied (publickey)` instead, check the ownership
+   and modes from step 2; sshd ignores keys that other users can write to.
+   (On an sshd running without PAM, a passwordless account can also be refused
+   outright — `sudo usermod -p '*' tapo` fixes that and still allows no
+   password login.)
+
+One more thing to set on the server itself:
+
 - **Boot on power restore.** Switching the plug back on only restores power —
   the machine boots itself only if its BIOS/UEFI is set to power on after AC
   loss. Look for "Restore on AC Power Loss" / "After Power Failure" and set it
